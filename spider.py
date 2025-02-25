@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 
 import os
+import argparse
+import hashlib
 import logging
 import urllib.parse
 
@@ -13,6 +15,8 @@ import aiohttp
 from lxml import html
 from contextvars import ContextVar
 
+from markitdown import MarkItDown
+
 from progress import percent_complete
 
 RequestFrequency = 5 # seconds / request
@@ -20,13 +24,15 @@ BaseURL = "https://learn.lianglianglee.com"
 BaseHeaders = {
     "user-agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 }
-ObsidianVault = "~/ObsidianVault/lianglianglee"
+ObsidianVaultPath = "/Users/wheat/WorkSpace/notes/CS/TechDigest"
+Workspace = "/Users/wheat/WorkSpace/tmp"
 
 completed_task_count = ContextVar("completed_task_count", default=0)
 total_task_count = ContextVar("total_task_count", default=0)
 
-
 logger = logging.getLogger("spider")
+
+md = MarkItDown()
 
 async def create_dir_if_not_exists(path):
     abs_path = os.path.expanduser(path)
@@ -119,15 +125,20 @@ async def scrape_and_persist(queue, session, item):
     if unquote_url_path == url_path:
         url_path = urllib.parse.quote(url_path, safe='/')
 
-    dl_file_name = os.path.basename(item["href"])
-    abs_parent_dir = os.path.join(ObsidianVault, item["column"])
-    dl_file_abs_path = os.path.join(abs_parent_dir, dl_file_name)
+    file_name = os.path.basename(item["href"])
+    raw_file_name = f"{hashlib.md5(file_name.encode()).hexdigest()}.html"
 
-    # logger.debug("dl_file_abs_path: %s", dl_file_abs_path)
-    file_exists = await aiofiles.os.path.exists(dl_file_abs_path)
-    if file_exists:
-        logger.info(f"file {dl_file_abs_path} already exists. load from local")
-        data = await load_content_from_local(dl_file_abs_path)
+    column_dir = os.path.join(ObsidianVaultPath, item["column"])
+    raw_column_dir = os.path.join(Workspace, item["column"])
+
+    md_file_path = os.path.join(column_dir, file_name)
+    raw_file_path = os.path.join(raw_column_dir, raw_file_name)
+
+    downloaded = await aiofiles.os.path.exists(raw_file_path)
+    processed = await aiofiles.os.path.exists(md_file_path)
+    if downloaded:
+        logger.info(f"file {raw_file_path} already exists. load from local")
+        data = await load_content_from_local(raw_file_path)
     else:
         data = await fetch_html(session, url_path)
 
@@ -135,22 +146,29 @@ async def scrape_and_persist(queue, session, item):
     posts = doc.body.find_class('book-post')
 
     # if no posts element found, save the whole html
-    if not posts and not file_exists:
-        async with aiofiles.open(dl_file_abs_path, 'w') as f:
+    if not posts and not downloaded:
+        async with aiofiles.open(md_file_path, 'w') as f:
             await f.write(data)
         return
 
     post = posts[0]
     content = post.find('.//div[p]')
-    await parse_imgs(content, queue, url_path, abs_parent_dir)
+    # title = post.find('.//h1')
+    await parse_imgs(content, queue, url_path, column_dir)
 
-    if not file_exists:
-        await create_dir_if_not_exists(abs_parent_dir)
-        async with aiofiles.open(dl_file_abs_path, 'w') as f:
+    if not downloaded:
+        await create_dir_if_not_exists(raw_column_dir)
+        async with aiofiles.open(raw_file_path, 'w') as f:
             data = ['\n']
             for item in content.iterchildren():
                 data.append(html.tostring(item, encoding="utf-8").decode())
             await f.write(''.join(data))
+
+    if not processed:
+        await create_dir_if_not_exists(column_dir)
+        async with aiofiles.open(md_file_path, 'w') as f:
+            result = md.convert_local(raw_file_path)
+            await f.write(result.text_content)
 
 
 async def dl_img(session, item):
@@ -173,21 +191,64 @@ async def scrape_worker(queue, session):
         except Exception as e:
             logger.error(f"scrape {item['href']} failed, error: {e}", exc_info=True, stack_info=True)
 
-
 async def progress_bar(queue, item_title):
     total_count = total_task_count.get()
     completed_count = completed_task_count.get()
     while not queue.empty():
-        await asyncio.sleep(5)
+        await asyncio.sleep(RequestFrequency)
         total_count = total_task_count.get()
         completed_count = completed_task_count.get()
         title = f"{item_title}, total: {total_count}, completed: {completed_count}"
         percent_complete(completed_count, total_count, title=title)
+    await asyncio.sleep(RequestFrequency)
+    total_count = total_task_count.get()
     percent_complete(total_count, total_count, title=title)
 
 
+def generate_toc(root_toc, args):
+    logger.info("args: %s", args)
+    if args.all:
+        logger.info("scrape all columns")
+        return root_toc
+    elif args.columns:
+        toc = [item for item in root_toc if item["title"] in args.columns]
+        logger.info("scrape specific columns: %s", '\n'.join([item["title"] for item in toc]))
+        return toc
+    elif args.range:
+        start, end = args.range.split('-')
+        toc = root_toc[int(start)-1:int(end)]
+        logger.info("scrape specific range of columns: %s", '\n'.join([item["title"] for item in toc]))
+        return toc
+    elif args.keyword:
+        toc = [item for item in root_toc if args.keyword in item["title"]]
+        logger.info("scrape columns with keyword: %s", '\n'.join([item["title"] for item in toc]))
+        return toc
+    else:
+        return []
+
+
 async def main():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    global Workspace
+    global ObsidianVaultPath
+
+    parser = argparse.ArgumentParser(prog='spider', description='Scrape content from learn.lianglianglee.com')
+    parser.add_argument('-d', '--debug', action='store_true', help='debug mode')
+    parser.add_argument('-o', '--output', type=str, help='output path', default=ObsidianVaultPath, required=True)
+    parser.add_argument('-w', '--workspace', type=str, help='workspace path', default=Workspace, required=True)
+
+    mutex_group = parser.add_mutually_exclusive_group(required=True)
+    mutex_group.add_argument('-a', '--all', action='store_true', help='scrape all columns', default=False)
+    mutex_group.add_argument('-c', '--column',action='append', dest='columns', help='scrape specific column, e.g. "24讲吃透分布式数据库-完"')
+    mutex_group.add_argument('-r', '--range', type=str, help='scrape specific range of columns, e.g. 1-3')
+    mutex_group.add_argument('-k', '--keyword', type=str, help='scrape columns with keyword, e.g. "分布式"')
+    args = parser.parse_args()
+
+    
+    ObsidianVaultPath = args.output
+    Workspace = args.workspace
+
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(level=log_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
     queue = asyncio.Queue()
 
@@ -196,11 +257,13 @@ async def main():
 
     context = asyncio.current_task().get_context()
 
-    async with aiohttp.ClientSession(base_url=BaseURL, headers=BaseHeaders) as session:
-        logger.info(f"start scraping {BaseURL}")
+    # disable ssl verification
+    connector = aiohttp.TCPConnector(keepalive_timeout=60, ssl=False)
+    async with aiohttp.ClientSession(base_url=BaseURL, headers=BaseHeaders, connector=connector) as session:
+        logger.info(f"\nstart scraping {BaseURL}")
         root_toc = await get_root_toc(session, "/")
-        logger.info("found %d columns", len(root_toc))
-        for item in root_toc[11:]:
+        toc = generate_toc(root_toc, args)
+        for item in toc:
             # reset progress
             completed_task_count.set(0)
             total_task_count.set(0)
@@ -212,6 +275,12 @@ async def main():
             worker = asyncio.create_task(scrape_worker(queue, session), context=context)
             await worker
             await progress
+    
+    # Graceful Shutdown
+    # To avoid "ResourceWarning: unclosed transport" warning
+    # see https://docs.aiohttp.org/en/stable/client_advanced.html#graceful-shutdown
+    await asyncio.sleep(2)    
 
 if __name__ == "__main__":
     asyncio.run(main())
+

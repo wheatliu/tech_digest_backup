@@ -7,3 +7,4 @@
 
 ## Requirements
 - Python 3.11+
+- [markitdown](https://github.com/microsoft/markitdown)
